@@ -4,6 +4,7 @@ httpx<1,>=0.27
 pydantic-settings<3,>=2.4
 sqlalchemy<3,>=2.0
 python-dateutil<3,>=2.9
+itsdangerous<3,>=2.1
 
 [dev]
 pytest<9,>=8

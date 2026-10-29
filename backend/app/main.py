@@ -8,7 +8,9 @@ from app.db.session import Base, SessionLocal, engine
 from app.models import User, UserInterest, RecommendationRecord
 from app.integrations.demo import DemoKohaClient, BOOKS, LOANS, HISTORY
 from app.integrations.koha import KohaClient, KohaError
-from app.services import recommendations, analytics
+from app.services import recommendations, analytics, hydrate
+from app.recommendations import CONTRACT_VERSION, HAS_LIGHTFM, ContractError, recommend, resolve_backend
+from app.integrations import koha as koha_adapter
 
 Base.metadata.create_all(bind=engine)
 if settings.demo_mode:
@@ -102,7 +104,7 @@ async def koha_health():
 @app.get(settings.api_prefix + "/dashboard")
 async def dashboard(request: Request):
     if settings.demo_mode:
-        return {"patron":{"name":"Alex Morgan","card":"•••• 1042","joined":"2021"},"loans":LOANS,"history":HISTORY[:3],"recommendations":recommendations(3),"analytics":analytics(),"source":"demo"}
+        return {"patron":{"name":"Alex Morgan","card":"•••• 1042","joined":"2021"},"loans":LOANS,"history":HISTORY[:3],"recommendations":await personal_recommendations(request, 3),"analytics":analytics(),"source":"demo"}
     patron_id = request.session.get("patron_id")
     if not patron_id:
         raise HTTPException(401, "Sign in with your library account to load your dashboard")
@@ -118,9 +120,11 @@ async def dashboard(request: Request):
     except KohaError as exc:
         capability_error(exc)
     overdue = sum(loan["status"] == "Overdue" for loan in current)
+    try: picks = await personal_recommendations(request, 3)
+    except HTTPException: picks = []  # loans stay useful even if ranking input is unavailable
     return {
         "patron":{"name":request.session.get("userid") or "Library member","card":"","joined":""},
-        "loans":current,"history":history[:8],"recommendations":[],
+        "loans":current,"history":history[:8],"recommendations":picks,
         "analytics":{"borrowed_period":len(history),"active_loans":len(current),"overdue":overdue,"returned":len(history),"subjects":[],"trend":[]},
         "source":"koha",
     }
@@ -167,14 +171,66 @@ async def borrowing_current(request: Request):
     except KohaError as exc: capability_error(exc)
 
 
+# Resolved once at startup so RECOMMENDER_BACKEND=lightfm fails fast when LightFM is missing.
+RECOMMENDER = resolve_backend(settings.recommender_backend)
+
+
+def _portal_user(db: Session, borrower_id: str):
+    return db.scalar(select(User).where(User.koha_borrower_id == borrower_id))
+
+
+def _saved_interests(borrower_id: str) -> list[str]:
+    with SessionLocal() as db:
+        user = _portal_user(db, borrower_id)
+        return list(db.scalars(select(UserInterest.subject).where(UserInterest.user_id == user.id)).all()) if user else []
+
+
+def _store_recommendations(borrower_id: str, rows: list[dict]):
+    """Keep the latest generated list per portal user (audit/debug; not read back for ranking)."""
+    with SessionLocal() as db:
+        user = _portal_user(db, borrower_id)
+        if user is None: return
+        db.query(RecommendationRecord).filter_by(user_id=user.id).delete()
+        db.add_all([RecommendationRecord(user_id=user.id, book_id=str(r["id"]), score=float(r["score"]), reason=r["reason"], strategy=r["strategy"]) for r in rows])
+        db.commit()
+
+
+def _display_book(entry: dict) -> dict:
+    labels = {"available": "Available", "unavailable": "On loan"}
+    return include_catalogue_link({"id": entry["book_id"], "title": entry["title"], "authors": entry.get("authors") or [], "subjects": (entry.get("subjects") or []) + (entry.get("genres") or []), "year": entry.get("publication_year"), "description": entry.get("description") or "", "availability": labels.get(entry.get("availability"), "Unknown"), "copies": None, "source": "koha"})
+
+
+async def personal_recommendations(request: Request, limit: int) -> list[dict]:
+    if settings.demo_mode:
+        rows = recommendations(limit, _saved_interests("DEMO-1042"), RECOMMENDER)
+        _store_recommendations("DEMO-1042", rows)
+        return rows
+    patron_id = request.session.get("patron_id")
+    if not patron_id: raise HTTPException(401, "Sign in with your library account to get personal recommendations")
+    client = integration()
+    try:
+        snapshot = await client.build_recommendation_snapshot(str(patron_id), _saved_interests(str(patron_id)))
+        rows = hydrate(recommend(snapshot, limit, backend=RECOMMENDER), [_display_book(e) for e in snapshot["catalogue"]])
+    except KohaError as exc: capability_error(exc)
+    except ContractError as exc: raise HTTPException(502, f"Recommendation input was invalid: {exc}")
+    _store_recommendations(str(patron_id), rows)
+    return rows
+
+
 @app.get(settings.api_prefix + "/recommendations")
-def get_recommendations():
-    if not settings.demo_mode: raise HTTPException(503, "Personal recommendations require authorized Koha borrowing history")
-    return {"items":recommendations(8),"source":"demo"}
+async def get_recommendations(request: Request):
+    return {"items": await personal_recommendations(request, 8), "source": "demo" if settings.demo_mode else "koha", "engine": RECOMMENDER}
+
+
+@app.get(settings.api_prefix + "/recommendations/status")
+def recommendation_status():
+    return {"engine": RECOMMENDER, "configured": settings.recommender_backend, "lightfm_installed": HAS_LIGHTFM, "contract_version": CONTRACT_VERSION}
 
 
 @app.post(settings.api_prefix + "/recommendations/refresh")
-def refresh_recommendations(): return get_recommendations()
+async def refresh_recommendations(request: Request):
+    koha_adapter._CATALOGUE_CACHE.clear()
+    return await get_recommendations(request)
 
 
 @app.get(settings.api_prefix + "/analytics/overview")

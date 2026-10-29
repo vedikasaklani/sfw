@@ -26,7 +26,8 @@ def test_live_mode_does_not_substitute_sample_catalogue(monkeypatch):
     response = client.get("/api/v1/catalogue")
     assert response.status_code == 503
     assert "KOHA_CLIENT_ID" in response.json()["detail"]
-    assert client.get("/api/v1/dashboard").status_code == 503
+    assert client.get("/api/v1/dashboard").status_code == 401  # live dashboard needs a signed-in patron
+    assert client.get("/api/v1/recommendations").status_code == 401
 
 
 def test_catalogue_search_and_pagination():

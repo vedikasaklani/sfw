@@ -16,4 +16,5 @@ modern_library_portal.egg-info/dependency_links.txt
 modern_library_portal.egg-info/requires.txt
 modern_library_portal.egg-info/top_level.txt
 tests/test_api.py
+tests/test_koha.py
 tests/test_services.py

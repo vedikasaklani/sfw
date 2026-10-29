@@ -128,9 +128,16 @@ Do not modify the recommendation engine to read raw Koha records. Update the ada
 4. Keep adapter changes covered by mocked Koha HTTP responses under `backend/tests`; do not make ordinary recommendation work call the live KTD.
 5. If Koha adds a field, record the raw name, endpoint/permission, nullability, transformation, and privacy classification here before using it.
 
-## Current implementation gap
+## Current implementation
 
-`map_biblio` currently normalizes only ID, title, author, subject (when present), publication year, ISBN, abstract/notes, and a placeholder availability. The current KTD flattened biblio JSON response does not expose `subject`/`subjects`, although MARC fields such as `600`, `610`, and `650` exist on the inspected record. Therefore subject-based live recommendations need a MARC-in-JSON/MARCXML extraction step (or a verified Koha field/endpoint) before they can be considered complete. Item availability is fetched separately and current checkout history is available, but the production recommendation engine remains a separate implementation task.
+- `app/recommendations/engine.py` is the engine: pure ranking over a contract `1.0` snapshot, with no Koha imports or network. It validates `contract_version`, required fields and event status before scoring.
+- Scoring blends a reader taste profile with library-wide popularity (15%) and a small availability nudge. The profile covers authors, contributors, subjects, genres, series, format and language, with recency decay (half-life 120 days) and current loans weighted at 0.6. The engine also adds a LightFM WARP hybrid model over item features when `lightfm` is installed (`pip install -e '.[ml]'`, needs a C compiler). Without it, the engine returns the same output shape.
+- Every result has `book_id`, `score`, `reason_code` (`same_series`, `same_author`, `explicit_interest`, `similar_subject`, `popular`, `discovery`) and human-readable `reason`. Books already in `reader_history` are never suggested.
+- In `app/integrations/koha.py`:
+  - `extract_marc21_v1` reads subjects (`600`–`653`), genres (`655`), contributors (`100`/`700` families), language (`041`/`008`), series (`830`/`490`), content type (`336`) and summary (`520`) from MARC-in-JSON.
+  - `contract_book` builds the contract entry from the flat biblio, the MARC extract and the raw items. Item aggregate counts become `popularity`. Barcodes, notes and prices are never copied.
+  - `build_recommendation_snapshot` combines the first 60 OPAC-visible biblios (cached for 15 minutes) with every work in the patron's history and current loans.
+- Demo mode maps the sample library through `app.services.demo_snapshot`, so both modes run the same engine. The latest list per portal user is stored in the `recommendations` table.
 
 ## Sources
 

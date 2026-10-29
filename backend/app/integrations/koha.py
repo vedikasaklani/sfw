@@ -94,6 +94,75 @@ def map_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+MARC_SUBJECT_TAGS = ("600", "610", "611", "630", "648", "650", "651", "653")
+
+
+def _marc_fields(marc: dict[str, Any], tag: str) -> list[Any]:
+    return [f[tag] for f in marc.get("fields", []) if isinstance(f, dict) and tag in f]
+
+
+def _subfield(field: Any, code: str) -> list[str]:
+    if not isinstance(field, dict):
+        return []
+    return [str(sf[code]).strip().rstrip(" .,;:/") for sf in field.get("subfields", []) if isinstance(sf, dict) and sf.get(code)]
+
+
+def extract_marc21_v1(marc: dict[str, Any]) -> dict[str, Any]:
+    """MARC21 (MARC-in-JSON) -> contract fields. Only known tags are read; unknown tags are ignored."""
+    if not isinstance(marc, dict):
+        return {}
+    pick = lambda tags, code="a": list(dict.fromkeys(v for t in tags for f in _marc_fields(marc, t) for v in _subfield(f, code) if v))
+    control_008 = next((f for f in _marc_fields(marc, "008") if isinstance(f, str)), "")
+    language = (pick(("041",)) or [control_008[35:38].strip() if len(control_008) >= 38 else ""])[0] or None
+    summary = pick(("520",))
+    return {
+        "authors": pick(("100", "110", "111")),
+        "contributors": pick(("700", "710", "711", "720")),
+        "subjects": pick(MARC_SUBJECT_TAGS),
+        "genres": pick(("655",)),
+        "language": language,
+        "series": (pick(("830", "490")) or [None])[0],
+        "format": (pick(("336",)) or [None])[0],
+        "description": summary[0] if summary else None,
+    }
+
+
+def _count(value: Any) -> int | None:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def contract_book(record: dict[str, Any], marc: dict[str, Any], raw_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build one source-neutral catalogue entry; no Koha IDs, barcodes or staff fields leave here."""
+    mapped = map_biblio(record)
+    statuses = [map_item(i)["status"] for i in raw_items]
+    year = record.get("publication_year")
+    def total(key):
+        counts = [c for c in (_count(i.get(key)) for i in raw_items) if c is not None]
+        return sum(counts) if counts else None
+    return {
+        "book_id": mapped["id"],
+        "title": mapped["title"],
+        "authors": marc.get("authors") or mapped["authors"],
+        "contributors": marc.get("contributors") or [],
+        "subjects": marc.get("subjects") or mapped["subjects"],
+        "genres": marc.get("genres") or [],
+        "language": marc.get("language"),
+        "publication_year": int(year) if str(year or "").isdigit() else None,
+        "publisher": record.get("publisher") or None,
+        "series": marc.get("series") or record.get("series_title") or None,
+        "format": marc.get("format") or record.get("item_type") or None,
+        "description": marc.get("description") or mapped["description"] or None,
+        "age_restriction": record.get("age_restriction") or None,
+        "availability": "available" if "Available" in statuses else "unavailable" if statuses and "Unknown" not in statuses else "unknown",
+        "popularity": {"checkouts": total("checkouts_count"), "renewals": total("renewals_count"), "holds": total("holds_count")},
+    }
+
+
+# shortcut: per-process cache of the candidate catalogue, move to the DB if several workers run.
+_CATALOGUE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+CATALOGUE_TTL = 900
+
+
 class KohaClient:
     """Koha HTTP/auth boundary. One client instance can be shared by the app."""
     demo = False
@@ -257,7 +326,7 @@ class KohaClient:
         record["availability"] = ("Available" if "Available" in statuses else "On loan" if statuses and all(s == "On loan" for s in statuses) else "Unavailable" if statuses and all(s in {"Lost", "Withdrawn", "Not for loan"} for s in statuses) else "Unknown")
         return record
 
-    async def get_book_items(self, book_id: str) -> list[dict[str, Any]]:
+    async def _item_rows(self, book_id: str) -> list[dict[str, Any]]:
         if not book_id.isdigit():
             raise KohaNotFoundError()
         items: list[dict[str, Any]] = []
@@ -265,7 +334,7 @@ class KohaClient:
             payload, headers = await self._get(f"biblios/{quote(book_id, safe='')}/items", {"_page": page, "_per_page": 100})
             if not isinstance(payload, list):
                 raise KohaUpstreamError("Koha returned an unexpected item response", 502)
-            items.extend(map_item(row) for row in payload if isinstance(row, dict))
+            items.extend(row for row in payload if isinstance(row, dict))
             total = headers.get("x-total-count")
             has_next = 'rel="next"' in headers.get("link", "")
             if total and total.isdigit():
@@ -273,6 +342,60 @@ class KohaClient:
             elif not has_next:
                 break
         return items
+
+    async def get_book_items(self, book_id: str) -> list[dict[str, Any]]:
+        return [map_item(row) for row in await self._item_rows(book_id)]
+
+    async def _contract_entry(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        book_id = str(record.get("biblio_id") or "")
+        if not book_id.isdigit() or record.get("opac_suppressed"):
+            return None
+        try:
+            marc, _ = await self._get(f"biblios/{book_id}", request_headers={"Accept": "application/marc-in-json"})
+        except KohaError:
+            marc = {}  # subjects are optional in the contract; fall back to flat fields
+        try:
+            items = await self._item_rows(book_id)
+        except KohaError:
+            items = []
+        return contract_book(record, extract_marc21_v1(marc), items)
+
+    async def recommendation_catalogue(self, required_ids: set[str], max_records: int = 60) -> list[dict[str, Any]]:
+        """Candidate works plus every work in the reader's history, in contract form."""
+        cached = _CATALOGUE_CACHE.get(self.base)
+        if cached and time.time() - cached[0] < CATALOGUE_TTL:
+            entries = cached[1]
+        else:
+            payload, _ = await self._get("biblios", {"_page": 1, "_per_page": max_records})
+            records = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+            gate = asyncio.Semaphore(8)
+
+            async def one(record):
+                async with gate:
+                    return await self._contract_entry(record)
+            entries = [e for e in await asyncio.gather(*(one(r) for r in records)) if e]
+            _CATALOGUE_CACHE[self.base] = (time.time(), entries)
+        known = {e["book_id"] for e in entries}
+        extra = []
+        for book_id in sorted(i for i in required_ids if i.isdigit() and i not in known):
+            try:
+                record, _ = await self._get(f"biblios/{book_id}")
+            except KohaError:
+                continue
+            if isinstance(record, dict) and (entry := await self._contract_entry(record)):
+                extra.append(entry)
+        return entries + extra
+
+    async def build_recommendation_snapshot(self, borrower_id: str, interests: list[str] | None = None) -> dict[str, Any]:
+        current = await self.get_current_checkouts(borrower_id)
+        try:
+            history = await self.get_history(borrower_id)
+        except KohaError:
+            history = []  # history permission/privacy may be off; current loans still help
+        events = [{"book_id": h["book_id"], "checked_out_on": h["checkout_date"] or h["date"], "returned_on": h["return_date"], "status": "returned"} for h in history if h["book_id"] and (h["checkout_date"] or h["date"])]
+        events += [{"book_id": c["book_id"], "checked_out_on": c["checkout_date"], "returned_on": None, "status": "active"} for c in current if c["book_id"] and c["checkout_date"]]
+        catalogue = await self.recommendation_catalogue({e["book_id"] for e in events})
+        return {"contract_version": "1.0", "catalogue": catalogue, "reader_history": events, "explicit_preferences": list(interests or [])}
 
     @staticmethod
     def _map_checkout(row: dict[str, Any], *, returned: bool = False) -> dict[str, Any]:
