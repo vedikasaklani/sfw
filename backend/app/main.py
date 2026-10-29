@@ -42,6 +42,13 @@ def capability_error(exc):
     raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
 
+def include_catalogue_link(book: dict):
+    book_id = str(book.get("id", ""))
+    if not settings.demo_mode and settings.koha_opac_url and book_id.isdigit():
+        book["catalogue_url"] = f"{settings.koha_opac_url.rstrip('/')}/cgi-bin/koha/opac-detail.pl?biblionumber={book_id}"
+    return book
+
+
 @app.post(settings.api_prefix + "/auth/login")
 async def login(request: Request, payload: dict):
     if settings.demo_mode:
@@ -93,22 +100,44 @@ async def koha_health():
 
 
 @app.get(settings.api_prefix + "/dashboard")
-def dashboard():
-    if not settings.demo_mode: raise HTTPException(503, "Patron dashboard requires an authenticated Koha borrower mapping; catalogue access is available independently")
-    return {"patron":{"name":"Alex Morgan","card":"•••• 1042","joined":"2021"},"loans":LOANS,"history":HISTORY[:3],"recommendations":recommendations(3),"analytics":analytics(),"source":"demo" if settings.demo_mode else "koha"}
+async def dashboard(request: Request):
+    if settings.demo_mode:
+        return {"patron":{"name":"Alex Morgan","card":"•••• 1042","joined":"2021"},"loans":LOANS,"history":HISTORY[:3],"recommendations":recommendations(3),"analytics":analytics(),"source":"demo"}
+    patron_id = request.session.get("patron_id")
+    if not patron_id:
+        raise HTTPException(401, "Sign in with your library account to load your dashboard")
+    try:
+        client = integration()
+        current = await client.get_current_checkouts(str(patron_id))
+        try:
+            history = await client.get_history(str(patron_id))
+        except KohaError:
+            # Keep the live loan dashboard useful when history access is not
+            # enabled; the dedicated history endpoint still reports the error.
+            history = []
+    except KohaError as exc:
+        capability_error(exc)
+    overdue = sum(loan["status"] == "Overdue" for loan in current)
+    return {
+        "patron":{"name":request.session.get("userid") or "Library member","card":"","joined":""},
+        "loans":current,"history":history[:8],"recommendations":[],
+        "analytics":{"borrowed_period":len(history),"active_loans":len(current),"overdue":overdue,"returned":len(history),"subjects":[],"trend":[]},
+        "source":"koha",
+    }
 
 
 @app.get(settings.api_prefix + "/catalogue")
 async def catalogue(q: str = "", subject: str | None = None, page: int = Query(1, ge=1), page_size: int = Query(12, ge=1, le=50)):
     try:
         result = await integration().search_catalogue(q, subject, page, page_size)
+        result["items"] = [include_catalogue_link(item) for item in result["items"]]
         return {**result,"source":"demo" if settings.demo_mode else "koha"}
     except KohaError as e: capability_error(e)
 
 
 @app.get(settings.api_prefix + "/catalogue/{book_id}")
 async def book(book_id: str):
-    try: return await integration().get_book(book_id)
+    try: return include_catalogue_link(await integration().get_book(book_id))
     except KohaError as e: capability_error(e)
 
 
@@ -121,15 +150,21 @@ async def book_items(book_id: str):
 
 
 @app.get(settings.api_prefix + "/borrowing/history")
-def borrowing_history():
-    if not settings.demo_mode: raise HTTPException(503, "Patron authentication and circulation route must be configured for this Koha instance")
-    return {"items":HISTORY,"source":"demo"}
+async def borrowing_history(request: Request):
+    if settings.demo_mode: return {"items":HISTORY,"source":"demo"}
+    patron_id = request.session.get("patron_id")
+    if not patron_id: raise HTTPException(401, "Sign in with your library account to view checkout history")
+    try: return {"items":await integration().get_history(str(patron_id)),"source":"koha"}
+    except KohaError as exc: capability_error(exc)
 
 
 @app.get(settings.api_prefix + "/borrowing/current")
-def borrowing_current():
-    if not settings.demo_mode: raise HTTPException(503, "Patron authentication and circulation route must be configured for this Koha instance")
-    return {"items":LOANS,"source":"demo"}
+async def borrowing_current(request: Request):
+    if settings.demo_mode: return {"items":LOANS,"source":"demo"}
+    patron_id = request.session.get("patron_id")
+    if not patron_id: raise HTTPException(401, "Sign in with your library account to view current loans")
+    try: return {"items":await integration().get_current_checkouts(str(patron_id)),"source":"koha"}
+    except KohaError as exc: capability_error(exc)
 
 
 @app.get(settings.api_prefix + "/recommendations")

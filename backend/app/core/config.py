@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     frontend_origins: str = ""
     demo_mode: bool = True
     koha_base_url: str = ""
+    koha_opac_url: str = "http://localhost:8080"
     koha_api_prefix: str = "/api/v1"
     koha_auth_method: str = "oauth2"
     koha_api_token: str = ""

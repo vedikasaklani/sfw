@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+from datetime import date, datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -157,15 +158,15 @@ class KohaClient:
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None, *, retry_auth: bool = True) -> tuple[Any, httpx.Headers]:
+    async def _get(self, path: str, params: dict[str, Any] | None = None, *, request_headers: dict[str, str] | None = None, retry_auth: bool = True) -> tuple[Any, httpx.Headers]:
         auth = (self.username, self.password) if self.auth_method == "basic" else None
         try:
             async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-                response = await client.get(f"{self.base}/{path.lstrip('/')}", params=params, headers=await self._headers(), auth=auth)
+                response = await client.get(f"{self.base}/{path.lstrip('/')}", params=params, headers={**(await self._headers()), **(request_headers or {})}, auth=auth)
             if response.status_code == 401 and retry_auth and self.auth_method == "oauth2":
                 self._access_token = None
                 self._token_expiry = 0
-                return await self._get(path, params, retry_auth=False)
+                return await self._get(path, params, request_headers=request_headers, retry_auth=False)
             if response.status_code in (401, 403):
                 raise KohaAuthenticationError()
             if response.status_code == 404:
@@ -273,8 +274,64 @@ class KohaClient:
                 break
         return items
 
-    async def get_current_checkouts(self, borrower_id: str):
-        raise KohaUpstreamError("Patron circulation is not enabled in the catalogue integration", 503)
+    @staticmethod
+    def _map_checkout(row: dict[str, Any], *, returned: bool = False) -> dict[str, Any]:
+        item = row.get("item") if isinstance(row.get("item"), dict) else {}
+        biblio = item.get("biblio") if isinstance(item.get("biblio"), dict) else {}
+        biblio_id = item.get("biblio_id") or biblio.get("biblio_id") or row.get("biblio_id")
+        item_id = row.get("item_id") or item.get("item_id")
+        due_value = row.get("due_date")
+        due_date = str(due_value)[:10] if due_value else None
+        checked_in = row.get("checkin_date")
+        try:
+            due_at = datetime.fromisoformat(str(due_value).replace("Z", "+00:00")) if due_value else None
+            if due_at and due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            overdue = bool(due_at and due_at.date() < datetime.now(timezone.utc).date())
+        except ValueError:
+            overdue = False
+        status = "Returned" if returned or checked_in else "Overdue" if overdue else "On track"
+        authors = _as_list(biblio.get("author") or item.get("author"))
+        return {
+            "id": str(row.get("checkout_id") or item_id or ""),
+            "book_id": str(biblio_id or item_id or ""),
+            "item_id": item_id,
+            "title": str(biblio.get("title") or item.get("title") or row.get("title") or "Library item"),
+            "authors": authors,
+            "checkout_date": str(row.get("checkout_date") or "")[:10],
+            "due_date": due_date,
+            "return_date": str(checked_in)[:10] if checked_in else None,
+            "date": str(checked_in or row.get("checkout_date") or "")[:10],
+            "subjects": _as_list(biblio.get("subject") or biblio.get("subjects")),
+            "status": status,
+        }
 
-    async def get_history(self, borrower_id: str):
-        raise KohaUpstreamError("Patron history is not enabled in the catalogue integration", 503)
+    async def _checkout_list(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            page_params = {**(params or {}), "_page": page, "_per_page": 100}
+            payload, headers = await self._get(path, page_params, request_headers={"x-koha-embed": "item, item.biblio"})
+            if not isinstance(payload, list):
+                raise KohaUpstreamError("Koha returned an unexpected checkout response", 502)
+            rows.extend(row for row in payload if isinstance(row, dict))
+            total = headers.get("x-total-count")
+            has_next = 'rel="next"' in headers.get("link", "")
+            if total and total.isdigit():
+                if len(rows) >= int(total):
+                    break
+            elif not has_next:
+                break
+        return rows
+
+    async def get_current_checkouts(self, borrower_id: str) -> list[dict[str, Any]]:
+        if not borrower_id.isdigit():
+            raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
+        rows = await self._checkout_list("checkouts", {"patron_id": int(borrower_id)})
+        return [self._map_checkout(row) for row in rows if not row.get("checkin_date")]
+
+    async def get_history(self, borrower_id: str) -> list[dict[str, Any]]:
+        if not borrower_id.isdigit():
+            raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
+        rows = await self._checkout_list(f"patrons/{quote(borrower_id, safe='')}/checkouts")
+        returned = [row for row in rows if row.get("checkin_date")]
+        return [self._map_checkout(row, returned=True) for row in returned]

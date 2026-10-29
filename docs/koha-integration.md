@@ -26,6 +26,7 @@ Set these only in the ignored local `backend/.env` (or deployment secret store):
 ```dotenv
 DEMO_MODE=false
 KOHA_BASE_URL=http://localhost:8081
+KOHA_OPAC_URL=http://localhost:8080
 KOHA_API_PREFIX=/api/v1
 KOHA_AUTH_METHOD=oauth2
 KOHA_CLIENT_ID=<issued by Koha>
@@ -68,7 +69,15 @@ Current result: health 200, search 200 with five real records, detail 200, and i
 
 The Account page now contains a patron sign-in form. It sends the username/card number and password to the portal backend, which validates them through Koha's `POST /api/v1/auth/password/validation` operation. Koha documents the required permission as `borrowers:api_validate_password`; add this subpermission to the configured API key under the Koha staff account's **More → Manage API keys** permissions. This allows password validation without broad borrower-record access. A successful login sets a signed HTTP-only session cookie containing only the patron ID and userid. The password is not stored or logged.
 
+Book details now include a link to the corresponding Koha OPAC record, built with `KOHA_OPAC_URL` and Koha's biblio ID. It opens the same library catalogue in a new tab, where Koha can offer OPAC holds and other catalog actions. The portal does not submit holds itself.
+
 `APP_SESSION_SECRET` is generated in the ignored local `backend/.env`; restart the backend after changing it. Keep `SESSION_COOKIE_SECURE=false` only for local HTTP development; set it to `true` when serving the portal over HTTPS. Sign-in verifies identity only. Borrower profiles, loans, history, recommendations and analytics still need their own authorized Koha integration.
+
+### Borrowing data needed for “My reading”
+
+After sign-in, the backend uses the patron ID stored in the signed session (never an ID supplied by the browser) to call Koha. The current official API documents `GET /api/v1/checkouts?patron_id={id}` for active loans and `GET /api/v1/patrons/{patron_id}/checkouts` for checkout history. The latter also requires `borrowers:view_checkout_history`; Koha privacy/retention settings can limit which past returns exist. The integration requests item and biblio embeds, then maps titles, authors, checkout/due/return dates and overdue state without returning barcodes or other borrower records to the browser. Renewal status/actions would additionally call `GET /checkouts/{checkout_id}/allows_renewal` and, only when offered, `POST /checkouts/{checkout_id}/renewals`; those actions are not implemented yet.
+
+Koha's current API spec lists `circulate:circulate_remaining_permissions` and `circulate:manage_bookings` for listing checkouts, plus `borrowers:view_checkout_history` for patron checkout history. `circulate_remaining_permissions` grants broad circulation rights in Koha (not read-only access), so have the Koha administrator review the API account's scope before adding it. The portal now has the checkout fetch/mapping and dashboard display; if Koha's own test request returns HTTP 200 but this portal shows an error or empty result, check the request is using the same authenticated API key and patron ID session.
 
 ## Portal mapping and safety
 
