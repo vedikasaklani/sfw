@@ -310,7 +310,9 @@ class KohaClient:
         rows: list[dict[str, Any]] = []
         for page in range(1, 101):
             page_params = {**(params or {}), "_page": page, "_per_page": 100}
-            payload, headers = await self._get(path, page_params, request_headers={"x-koha-embed": "item, item.biblio"})
+            # Koha 26.06 rejects the combined nested value with 400; `item` is
+            # the supported embed here, and biblio metadata is mapped separately.
+            payload, headers = await self._get(path, page_params, request_headers={"x-koha-embed": "item"})
             if not isinstance(payload, list):
                 raise KohaUpstreamError("Koha returned an unexpected checkout response", 502)
             rows.extend(row for row in payload if isinstance(row, dict))
@@ -323,15 +325,38 @@ class KohaClient:
                 break
         return rows
 
+    async def _map_checkout_rows(self, rows: list[dict[str, Any]], *, returned: bool = False) -> list[dict[str, Any]]:
+        mapped = []
+        biblio_cache: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            checkout = dict(row)
+            item = dict(row.get("item")) if isinstance(row.get("item"), dict) else {}
+            biblio_id = item.get("biblio_id")
+            if not biblio_id and isinstance(item.get("biblio"), dict):
+                biblio_id = item["biblio"].get("biblio_id") or item["biblio"].get("id")
+            biblio = item.get("biblio") if isinstance(item.get("biblio"), dict) else {}
+            if biblio_id and not biblio.get("title"):
+                key = str(biblio_id)
+                if key not in biblio_cache:
+                    payload, _ = await self._get(f"biblios/{quote(key, safe='')}")
+                    if isinstance(payload, dict):
+                        biblio_cache[key] = payload
+                biblio = biblio_cache.get(key, biblio)
+                item["biblio"] = biblio
+            checkout["item"] = item
+            mapped.append(self._map_checkout(checkout, returned=returned))
+        return mapped
+
     async def get_current_checkouts(self, borrower_id: str) -> list[dict[str, Any]]:
         if not borrower_id.isdigit():
             raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
         rows = await self._checkout_list("checkouts", {"patron_id": int(borrower_id)})
-        return [self._map_checkout(row) for row in rows if not row.get("checkin_date")]
+        active = [row for row in rows if not row.get("checkin_date")]
+        return await self._map_checkout_rows(active)
 
     async def get_history(self, borrower_id: str) -> list[dict[str, Any]]:
         if not borrower_id.isdigit():
             raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
         rows = await self._checkout_list(f"patrons/{quote(borrower_id, safe='')}/checkouts")
         returned = [row for row in rows if row.get("checkin_date")]
-        return [self._map_checkout(row, returned=True) for row in returned]
+        return await self._map_checkout_rows(returned, returned=True)

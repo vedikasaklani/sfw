@@ -1,0 +1,61 @@
+{
+  "contract_version": "1.0",
+  "catalogue": [
+    {
+      "book_id": "sample-work-001",
+      "title": "The Lantern Map",
+      "authors": ["Mira Sen"],
+      "contributors": [],
+      "subjects": ["Mystery", "Small towns", "Maps"],
+      "genres": ["Detective fiction"],
+      "language": "eng",
+      "publication_year": 2021,
+      "publisher": "North Window Press",
+      "series": null,
+      "format": "Book",
+      "description": "A cartographer finds a set of clues hidden in a town map.",
+      "age_restriction": null,
+      "availability": "available",
+      "popularity": { "checkouts": 18, "renewals": 6, "holds": 2 }
+    },
+    {
+      "book_id": "sample-work-002",
+      "title": "Birds Along the River",
+      "authors": ["Jonah Reed"],
+      "contributors": [],
+      "subjects": ["Birds", "Rivers", "Field guides"],
+      "genres": ["Nature"],
+      "language": "eng",
+      "publication_year": 2019,
+      "publisher": "Fieldnote House",
+      "series": "Pocket Naturalist Guides",
+      "format": "Book",
+      "description": "An illustrated guide to common river birds.",
+      "age_restriction": null,
+      "availability": "unknown",
+      "popularity": { "checkouts": 9, "renewals": 4, "holds": 0 }
+    },
+    {
+      "book_id": "sample-work-003",
+      "title": "The Quiet Observatory",
+      "authors": ["Talia North"],
+      "contributors": ["R. Vale"],
+      "subjects": ["Astronomy", "Friendship", "Observatories"],
+      "genres": ["Contemporary fiction"],
+      "language": "eng",
+      "publication_year": 2023,
+      "publisher": "Blue Kite Books",
+      "series": null,
+      "format": "Book",
+      "description": "Two friends restore a small observatory above their coastal town.",
+      "age_restriction": null,
+      "availability": "unavailable",
+      "popularity": { "checkouts": 31, "renewals": 10, "holds": 8 }
+    }
+  ],
+  "reader_history": [
+    { "book_id": "sample-work-001", "checked_out_on": "2026-09-12", "returned_on": "2026-09-26", "status": "returned" },
+    { "book_id": "sample-work-003", "checked_out_on": "2026-10-12", "returned_on": null, "status": "active" }
+  ],
+  "explicit_preferences": ["Mystery", "Maps"]
+}

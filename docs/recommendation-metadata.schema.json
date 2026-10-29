@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commonplace.example/schemas/recommendation-metadata-1.0.json",
+  "title": "Library recommendation snapshot",
+  "description": "Source-neutral catalogue and reader signals for recommendation logic. Koha-specific translation belongs in the backend integration adapter.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "catalogue", "reader_history"],
+  "properties": {
+    "contract_version": { "const": "1.0" },
+    "catalogue": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/book" }
+    },
+    "reader_history": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/readingEvent" }
+    },
+    "explicit_preferences": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "book": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["book_id", "title"],
+      "properties": {
+        "book_id": { "type": "string", "minLength": 1, "description": "Opaque stable work identifier; never parse as a Koha ID." },
+        "title": { "type": "string", "minLength": 1 },
+        "authors": { "type": "array", "items": { "type": "string" } },
+        "contributors": { "type": "array", "items": { "type": "string" } },
+        "subjects": { "type": "array", "items": { "type": "string" } },
+        "genres": { "type": "array", "items": { "type": "string" } },
+        "language": { "type": ["string", "null"] },
+        "publication_year": { "type": ["integer", "null"], "minimum": 0, "maximum": 9999 },
+        "publisher": { "type": ["string", "null"] },
+        "series": { "type": ["string", "null"] },
+        "format": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "age_restriction": { "type": ["string", "null"], "description": "Optional library eligibility label, not an inferred reader attribute." },
+        "availability": { "enum": ["available", "unavailable", "unknown"] },
+        "popularity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "checkouts": { "type": ["integer", "null"], "minimum": 0 },
+            "renewals": { "type": ["integer", "null"], "minimum": 0 },
+            "holds": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        }
+      }
+    },
+    "readingEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["book_id", "checked_out_on", "status"],
+      "properties": {
+        "book_id": { "type": "string", "minLength": 1 },
+        "checked_out_on": { "type": "string", "format": "date" },
+        "returned_on": { "type": ["string", "null"], "format": "date" },
+        "status": { "enum": ["active", "returned"] }
+      }
+    }
+  }
+}
