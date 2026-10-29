@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     frontend_origins: str = ""
     demo_mode: bool = True
+    recommender_backend: str = "auto"  # auto | lightfm | content
     koha_base_url: str = ""
     koha_opac_url: str = "http://localhost:8080"
     koha_api_prefix: str = "/api/v1"

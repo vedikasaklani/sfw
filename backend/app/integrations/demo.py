@@ -26,7 +26,8 @@ class DemoKohaClient:
     demo = True
     async def search_catalogue(self, query="", subject=None, page=1, page_size=20):
         q = query.casefold()
-        filtered = [b for b in BOOKS if (not q or q in b["title"].casefold() or any(q in a.casefold() for a in b["authors"]) or any(q in s.casefold() for s in b["subjects"]) or q in b["isbn"]) and (not subject or subject in b["subjects"])]
+        subject_term = subject.strip().casefold()
+        filtered = [b for b in BOOKS if (not q or q in b["title"].casefold() or any(q in a.casefold() for a in b["authors"]) or any(q in s.casefold() for s in b["subjects"]) or q in b["isbn"]) and (not subject_term or any(subject_term in s.casefold() for s in b["subjects"]))]
         start = (page - 1) * page_size
         return {"items": filtered[start:start + page_size], "total": len(filtered), "page": page, "page_size": page_size}
     async def get_book(self, book_id):
