@@ -8,7 +8,7 @@ from app.db.session import Base, SessionLocal, engine
 from app.models import User, UserInterest, RecommendationRecord
 from app.integrations.demo import DemoKohaClient, BOOKS, LOANS, HISTORY
 from app.integrations.koha import KohaClient, KohaError
-from app.services import recommendations, analytics
+from app.services import recommendations, analytics, circulation_analytics
 
 Base.metadata.create_all(bind=engine)
 if settings.demo_mode:
@@ -117,11 +117,11 @@ async def dashboard(request: Request):
             history = []
     except KohaError as exc:
         capability_error(exc)
-    overdue = sum(loan["status"] == "Overdue" for loan in current)
+    metrics = circulation_analytics(current, history)
     return {
         "patron":{"name":request.session.get("userid") or "Library member","card":"","joined":""},
         "loans":current,"history":history[:8],"recommendations":[],
-        "analytics":{"borrowed_period":len(history),"active_loans":len(current),"overdue":overdue,"returned":len(history),"subjects":[],"trend":[]},
+        "analytics":metrics,
         "source":"koha",
     }
 
@@ -149,6 +149,87 @@ async def book_items(book_id: str):
     except KohaError as e: capability_error(e)
 
 
+def signed_in_patron_id(request: Request) -> str:
+    patron_id = request.session.get("patron_id")
+    if not patron_id:
+        raise HTTPException(401, "Sign in with your library account to use circulation actions")
+    return str(patron_id)
+
+
+@app.get(settings.api_prefix + "/catalogue/{book_id}/hold-options")
+async def hold_options(book_id: str, request: Request):
+    if settings.demo_mode:
+        raise HTTPException(503, "Holds require a live Koha connection")
+    patron_id = signed_in_patron_id(request)
+    try:
+        locations = await integration().get_hold_pickup_locations(book_id, patron_id)
+        return {"pickup_locations": locations, "source": "koha"}
+    except KohaError as exc:
+        capability_error(exc)
+
+
+@app.post(settings.api_prefix + "/catalogue/{book_id}/holds")
+async def place_hold(book_id: str, request: Request, payload: dict):
+    if settings.demo_mode:
+        raise HTTPException(503, "Holds require a live Koha connection")
+    patron_id = signed_in_patron_id(request)
+    pickup_library_id = str(payload.get("pickup_library_id") or "").strip()
+    if not pickup_library_id or len(pickup_library_id) > 10:
+        raise HTTPException(422, "Choose a valid pickup library")
+    try:
+        client = integration()
+        locations = await client.get_hold_pickup_locations(book_id, patron_id)
+        if pickup_library_id not in {location["library_id"] for location in locations}:
+            raise HTTPException(422, "Choose a pickup library offered by Koha for this title")
+        result = await client.place_hold(book_id, patron_id, pickup_library_id)
+        return {**result, "source": "koha"}
+    except KohaError as exc:
+        capability_error(exc)
+
+
+async def available_item_for_patron(book_id: str, item_id: str, patron_id: str, client):
+    if not book_id.isdigit() or not item_id.isdigit():
+        raise HTTPException(404, "Library item not found")
+    items = await client.get_book_items(book_id)
+    item = next((row for row in items if str(row.get("item_id")) == item_id), None)
+    if item is None:
+        raise HTTPException(404, "This item does not belong to the selected title")
+    if item["status"] != "Available":
+        raise HTTPException(409, "This copy is not available for checkout")
+    return await client.checkout_availability(patron_id, item_id)
+
+
+@app.get(settings.api_prefix + "/catalogue/{book_id}/items/{item_id}/checkout-options")
+async def checkout_options(book_id: str, item_id: str, request: Request):
+    if settings.demo_mode:
+        raise HTTPException(503, "Self-checkout requires a live Koha connection")
+    patron_id = signed_in_patron_id(request)
+    try:
+        availability = await available_item_for_patron(book_id, item_id, patron_id, integration())
+        return {"blockers": availability.get("blockers") or {}, "confirms": availability.get("confirms") or {}, "warnings": availability.get("warnings") or {}, "confirmation": availability.get("confirmation_token"), "source": "koha"}
+    except KohaError as exc:
+        capability_error(exc)
+
+
+@app.post(settings.api_prefix + "/catalogue/{book_id}/items/{item_id}/checkout")
+async def self_checkout(book_id: str, item_id: str, request: Request, payload: dict):
+    if settings.demo_mode:
+        raise HTTPException(503, "Self-checkout requires a live Koha connection")
+    patron_id = signed_in_patron_id(request)
+    confirmation = str(payload.get("confirmation") or "")
+    if not confirmation:
+        raise HTTPException(422, "Check checkout eligibility before confirming")
+    try:
+        client = integration()
+        availability = await available_item_for_patron(book_id, item_id, patron_id, client)
+        if availability.get("blockers"):
+            raise HTTPException(409, "Koha has blocked this checkout under the current circulation rules")
+        result = await client.self_checkout(patron_id, item_id, confirmation)
+        return {**result, "source": "koha"}
+    except KohaError as exc:
+        capability_error(exc)
+
+
 @app.get(settings.api_prefix + "/borrowing/history")
 async def borrowing_history(request: Request):
     if settings.demo_mode: return {"items":HISTORY,"source":"demo"}
@@ -167,6 +248,15 @@ async def borrowing_current(request: Request):
     except KohaError as exc: capability_error(exc)
 
 
+@app.get(settings.api_prefix + "/borrowing/holds")
+async def borrowing_holds(request: Request):
+    if settings.demo_mode: return {"items": [], "source": "demo"}
+    patron_id = request.session.get("patron_id")
+    if not patron_id: raise HTTPException(401, "Sign in with your library account to view your holds")
+    try: return {"items": await integration().get_patron_holds(str(patron_id)), "source": "koha"}
+    except KohaError as exc: capability_error(exc)
+
+
 @app.get(settings.api_prefix + "/recommendations")
 def get_recommendations():
     if not settings.demo_mode: raise HTTPException(503, "Personal recommendations require authorized Koha borrowing history")
@@ -178,9 +268,19 @@ def refresh_recommendations(): return get_recommendations()
 
 
 @app.get(settings.api_prefix + "/analytics/overview")
-def analytics_overview():
-    if not settings.demo_mode: raise HTTPException(503, "Reading analytics require authenticated Koha borrowing data")
-    return {**analytics(),"source":"demo"}
+async def analytics_overview(request: Request):
+    if settings.demo_mode:
+        return {**analytics(),"source":"demo"}
+    patron_id = request.session.get("patron_id")
+    if not patron_id:
+        raise HTTPException(401, "Sign in with your library account to view reading analytics")
+    try:
+        client = integration()
+        current = await client.get_current_checkouts(str(patron_id), include_subjects=True)
+        history = await client.get_history(str(patron_id), include_subjects=True)
+        return {**circulation_analytics(current, history),"source":"koha"}
+    except KohaError as exc:
+        capability_error(exc)
 
 
 @app.get(settings.api_prefix + "/profile")

@@ -20,6 +20,8 @@ A responsive library patron portal that sits in front of Koha. Koha remains auth
 - [ ] Complete live patron profile editing, self-service renewal actions, Alembic migrations, and notification delivery.
 - [x] Prepared assessment submissions for AST08 testing and AST09 catalogue UI design in `AST08_AST09_Submission.txt`, including executed outcomes and clearly stated live Koha limits.
 - [x] Documented Koha recommendation metadata sources and privacy limits; added a versioned source-neutral JSON Schema and synthetic offline fixture for recommendation work without Koha.
+- [x] Connect reading insights to authenticated Koha checkout and history endpoints; compute six-month trend, counts, and available MARC subject headings from patron circulation data.
+- [x] Add patron-scoped Koha hold placement and public self-checkout actions to live catalogue details; Koha validates pickup eligibility, checkout blockers and due dates.
 
 ## Local development
 

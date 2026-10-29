@@ -29,6 +29,10 @@ class KohaUpstreamError(KohaError):
     pass
 
 
+class KohaActionError(KohaError):
+    pass
+
+
 class KohaAPI(Protocol):
     demo: bool
     async def search_catalogue(self, query: str = "", subject: str | None = None, page: int = 1, page_size: int = 20) -> dict[str, Any]: ...
@@ -67,6 +71,27 @@ def map_biblio(record: dict[str, Any]) -> dict[str, Any]:
         "copies": None,
         "source": "koha",
     }
+
+
+def map_marc_subjects(record: Any) -> list[str]:
+    """Extract public subject headings from a Koha MARC-in-JSON record."""
+    if not isinstance(record, dict) or not isinstance(record.get("fields"), list):
+        return []
+    subjects: list[str] = []
+    tags = ("600", "610", "611", "630", "648", "650", "651", "653")
+    for field in record["fields"]:
+        if not isinstance(field, dict):
+            continue
+        for tag in tags:
+            value = field.get(tag)
+            if not isinstance(value, dict):
+                continue
+            subfields = value.get("subfields", [])
+            parts = [str(v).strip() for subfield in subfields if isinstance(subfield, dict) for code, v in subfield.items() if code in {"a", "x", "y", "z", "v"} and str(v).strip()] if isinstance(subfields, list) else []
+            heading = " -- ".join(parts)
+            if heading and heading not in subjects:
+                subjects.append(heading)
+    return subjects
 
 
 def map_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +213,42 @@ class KohaClient:
         except httpx.HTTPError as exc:
             raise KohaUpstreamError("Could not connect to the Koha REST API", 503) from exc
 
+    async def _post_json(self, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None, *, retry_auth: bool = True) -> Any:
+        auth = (self.username, self.password) if self.auth_method == "basic" else None
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
+                response = await client.post(f"{self.base}/{path.lstrip('/')}", params=params, json=payload, headers=await self._headers(), auth=auth)
+            if response.status_code == 401 and retry_auth and self.auth_method == "oauth2":
+                self._access_token = None
+                self._token_expiry = 0
+                return await self._post_json(path, payload, params, retry_auth=False)
+            if response.status_code in (401, 403):
+                raise KohaAuthenticationError("Koha denied this action. Check the API account permissions and Koha patron rules")
+            if response.status_code == 404:
+                raise KohaNotFoundError()
+            if response.status_code == 409:
+                raise KohaActionError("Koha cannot complete this action because of a circulation restriction", 409)
+            if response.status_code in (400, 412):
+                raise KohaActionError("Koha rejected this action. Check item eligibility and circulation rules", 409)
+            if response.status_code == 405:
+                raise KohaUpstreamError("This Koha self-checkout feature is disabled", 503)
+            if response.status_code == 429:
+                raise KohaUpstreamError("Koha rate limit reached; retry later", 503)
+            if response.status_code >= 500:
+                raise KohaUpstreamError("Koha circulation service is temporarily unavailable", 503)
+            if response.is_error:
+                raise KohaUpstreamError(f"Koha rejected the action (HTTP {response.status_code})", 502)
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise KohaUpstreamError("Koha returned malformed JSON", 502) from exc
+        except KohaError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise KohaUpstreamError("Koha circulation request timed out", 503) from exc
+        except httpx.HTTPError as exc:
+            raise KohaUpstreamError("Could not connect to the Koha REST API", 503) from exc
+
     async def validate_patron_password(self, identifier: str, password: str) -> dict[str, Any]:
         """Ask Koha to validate a patron; never retain the submitted password."""
         auth = (self.username, self.password) if self.auth_method == "basic" else None
@@ -274,6 +335,85 @@ class KohaClient:
                 break
         return items
 
+    async def get_hold_pickup_locations(self, biblio_id: str, patron_id: str) -> list[dict[str, Any]]:
+        if not biblio_id.isdigit() or not patron_id.isdigit():
+            raise KohaNotFoundError()
+        payload, _ = await self._get(f"biblios/{quote(biblio_id, safe='')}/pickup_locations", {"patron_id": int(patron_id)})
+        if not isinstance(payload, list):
+            raise KohaUpstreamError("Koha returned an unexpected pickup location response", 502)
+        return [{"library_id": str(row.get("library_id") or ""), "name": str(row.get("name") or row.get("library_id") or "")} for row in payload if isinstance(row, dict) and row.get("library_id")]
+
+    async def place_hold(self, biblio_id: str, patron_id: str, pickup_library_id: str) -> dict[str, Any]:
+        if not biblio_id.isdigit() or not patron_id.isdigit() or not pickup_library_id.strip():
+            raise KohaNotFoundError()
+        result = await self._post_json("holds", {"biblio_id": int(biblio_id), "patron_id": int(patron_id), "pickup_library_id": pickup_library_id.strip()})
+        if not isinstance(result, dict) or not result.get("hold_id"):
+            raise KohaUpstreamError("Koha did not confirm the hold", 502)
+        return {"hold_id": str(result["hold_id"]), "status": str(result.get("status") or "Placed"), "pickup_library_id": str(result.get("pickup_library_id") or pickup_library_id)}
+
+    async def get_patron_holds(self, patron_id: str) -> list[dict[str, Any]]:
+        """Return current holds for one authenticated patron, with public display fields."""
+        if not patron_id.isdigit():
+            raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
+        rows: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            payload, headers = await self._get(
+                f"patrons/{quote(patron_id, safe='')}/holds",
+                {"_page": page, "_per_page": 100},
+                request_headers={"x-koha-embed": "biblio,pickup_library,item,+strings"},
+            )
+            if not isinstance(payload, list):
+                raise KohaUpstreamError("Koha returned an unexpected holds response", 502)
+            rows.extend(row for row in payload if isinstance(row, dict))
+            total = headers.get("x-total-count")
+            has_next = 'rel="next"' in headers.get("link", "")
+            if total and total.isdigit():
+                if len(rows) >= int(total):
+                    break
+            elif not has_next:
+                break
+
+        holds = []
+        for row in rows:
+            biblio = row.get("biblio") if isinstance(row.get("biblio"), dict) else {}
+            item = row.get("item") if isinstance(row.get("item"), dict) else {}
+            pickup = row.get("pickup_library") if isinstance(row.get("pickup_library"), dict) else {}
+            status = row.get("status")
+            if not status and isinstance(row.get("_strings"), dict):
+                status = (row["_strings"].get("status") or {}).get("str") if isinstance(row["_strings"].get("status"), dict) else None
+            status_text = str(status or "Pending")
+            waiting_date = row.get("waiting_date")
+            status_key = status_text.casefold().replace(" ", "_")
+            ready = bool(waiting_date) or status_key in {"w", "waiting", "available", "ready", "ready_for_pickup"}
+            holds.append({
+                "id": str(row.get("hold_id") or ""),
+                "book_id": str(row.get("biblio_id") or biblio.get("biblio_id") or ""),
+                "title": str(biblio.get("title") or item.get("title") or "Library item"),
+                "authors": _as_list(biblio.get("author") or biblio.get("authors")),
+                "placed_date": str(row.get("hold_date") or "")[:10] or None,
+                "pickup_location": str(pickup.get("name") or pickup.get("library_id") or row.get("pickup_library_id") or ""),
+                "status": "Now available" if ready else status_text,
+                "available_now": ready,
+                "waiting_date": str(waiting_date)[:10] if waiting_date else None,
+            })
+        return holds
+
+    async def checkout_availability(self, patron_id: str, item_id: str) -> dict[str, Any]:
+        if not patron_id.isdigit() or not item_id.isdigit():
+            raise KohaNotFoundError()
+        payload, _ = await self._get("public/checkouts/availability", {"patron_id": int(patron_id), "item_id": int(item_id)})
+        if not isinstance(payload, dict):
+            raise KohaUpstreamError("Koha returned an unexpected checkout availability response", 502)
+        return payload
+
+    async def self_checkout(self, patron_id: str, item_id: str, confirmation: str) -> dict[str, Any]:
+        if not patron_id.isdigit() or not item_id.isdigit() or not confirmation:
+            raise KohaActionError("Checkout confirmation expired; check availability again", 409)
+        result = await self._post_json(f"public/patrons/{quote(patron_id, safe='')}/checkouts", {"item_id": int(item_id)}, {"confirmation": confirmation})
+        if not isinstance(result, dict):
+            raise KohaUpstreamError("Koha did not confirm the checkout", 502)
+        return {"checkout_id": str(result.get("checkout_id") or ""), "due_date": result.get("due_date")}
+
     @staticmethod
     def _map_checkout(row: dict[str, Any], *, returned: bool = False) -> dict[str, Any]:
         item = row.get("item") if isinstance(row.get("item"), dict) else {}
@@ -325,9 +465,10 @@ class KohaClient:
                 break
         return rows
 
-    async def _map_checkout_rows(self, rows: list[dict[str, Any]], *, returned: bool = False) -> list[dict[str, Any]]:
+    async def _map_checkout_rows(self, rows: list[dict[str, Any]], *, returned: bool = False, include_subjects: bool = False) -> list[dict[str, Any]]:
         mapped = []
         biblio_cache: dict[str, dict[str, Any]] = {}
+        subject_cache: dict[str, list[str]] = {}
         for row in rows:
             checkout = dict(row)
             item = dict(row.get("item")) if isinstance(row.get("item"), dict) else {}
@@ -343,20 +484,32 @@ class KohaClient:
                         biblio_cache[key] = payload
                 biblio = biblio_cache.get(key, biblio)
                 item["biblio"] = biblio
+            if include_subjects and biblio_id and not (biblio.get("subject") or biblio.get("subjects")):
+                key = str(biblio_id)
+                if key not in subject_cache:
+                    try:
+                        marc, _ = await self._get(f"biblios/{quote(key, safe='')}", request_headers={"Accept": "application/marc-in-json"})
+                        subject_cache[key] = map_marc_subjects(marc)
+                    except KohaError:
+                        # Subjects enrich analytics but are optional; a MARC
+                        # representation failure must not discard checkout counts.
+                        subject_cache[key] = []
+                if subject_cache[key]:
+                    biblio["subjects"] = subject_cache[key]
             checkout["item"] = item
             mapped.append(self._map_checkout(checkout, returned=returned))
         return mapped
 
-    async def get_current_checkouts(self, borrower_id: str) -> list[dict[str, Any]]:
+    async def get_current_checkouts(self, borrower_id: str, *, include_subjects: bool = False) -> list[dict[str, Any]]:
         if not borrower_id.isdigit():
             raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
         rows = await self._checkout_list("checkouts", {"patron_id": int(borrower_id)})
         active = [row for row in rows if not row.get("checkin_date")]
-        return await self._map_checkout_rows(active)
+        return await self._map_checkout_rows(active, include_subjects=include_subjects)
 
-    async def get_history(self, borrower_id: str) -> list[dict[str, Any]]:
+    async def get_history(self, borrower_id: str, *, include_subjects: bool = False) -> list[dict[str, Any]]:
         if not borrower_id.isdigit():
             raise KohaNotFoundError("Signed-in Koha patron identity is invalid")
         rows = await self._checkout_list(f"patrons/{quote(borrower_id, safe='')}/checkouts")
         returned = [row for row in rows if row.get("checkin_date")]
-        return await self._map_checkout_rows(returned, returned=True)
+        return await self._map_checkout_rows(returned, returned=True, include_subjects=include_subjects)

@@ -13,8 +13,8 @@
 
 An administrator with access to the KTD staff interface must:
 
-1. In Koha system preferences, enable `RESTOAuth2ClientCredentials`. If OAuth is unavailable and Basic auth is selected, enable `RESTBasicAuth` instead. Koha documentation says these preferences gate the respective REST API auth flows.
-2. Use a dedicated Koha API staff identity with only the `catalogue: 1` permission required for reading bibliographic records and items. Do not grant circulation, catalogue-editing or other write permissions for this slice.
+1. In Koha system preferences, enable `RESTOAuth2ClientCredentials`. If OAuth is unavailable and Basic auth is selected, enable `RESTBasicAuth` instead. Koha documentation says these preferences gate the respective REST API auth flows. For portal self-checkout, also review and enable `RESTPublicAPI` as described below.
+2. Use a dedicated Koha API staff identity. The base catalogue integration needs `catalogue: 1` for reading bibliographic records and items. Grant the extra action permissions below only if the library wants the corresponding portal actions enabled.
 3. Open that user's Koha account and select **More → Manage API keys**, create an API key pair, and deliver its client ID and secret to the backend operator through the local secret channel. Koha’s [official manual](https://koha-community.org/manual/21.05/en/html/webservices.html) describes this account key workflow. Do not put credentials in source control, the frontend, issue text, or logs.
 
 Koha `26.06` is a development version, so use the [official current REST API reference](https://api.koha-community.org/Development.html) and confirm the matching operations in KTD before granting access. The current official API docs describe OAuth2 client credentials and Basic auth as system-preference gated and note that responses can be redacted by API-user permissions. The biblios list/detail and items routes require `catalogue: 1` in the documented spec. See also the [official system-preference documentation](https://koha-community.org/manual/latest/en/html/webservicespreferences.html).
@@ -69,9 +69,24 @@ Current result: health 200, search 200 with five real records, detail 200, and i
 
 The Account page now contains a patron sign-in form. It sends the username/card number and password to the portal backend, which validates them through Koha's `POST /api/v1/auth/password/validation` operation. Koha documents the required permission as `borrowers:api_validate_password`; add this subpermission to the configured API key under the Koha staff account's **More ? Manage API keys** permissions. This allows password validation without broad borrower-record access. A successful login sets a signed HTTP-only session cookie containing only the patron ID and userid. The password is not stored or logged. Live login plus dashboard was verified against KTD; three test checkouts were created for the requested test patron and Koha applied a due date of 2026-11-03.
 
-Book details now include a link to the corresponding Koha OPAC record, built with `KOHA_OPAC_URL` and Koha's biblio ID. It opens the same library catalogue in a new tab, where Koha can offer OPAC holds and other catalog actions. The portal does not submit holds itself.
+Book details include a link to the corresponding Koha OPAC record, built with `KOHA_OPAC_URL` and Koha's biblio ID. It opens the full Koha record, where the library can offer OPAC options alongside the portal's hold and self-checkout actions.
 
-`APP_SESSION_SECRET` is generated in the ignored local `backend/.env`; restart the backend after changing it. Keep `SESSION_COOKIE_SECURE=false` only for local HTTP development; set it to `true` when serving the portal over HTTPS. Sign-in verifies identity only. Borrower profiles, loans, history, recommendations and analytics still need their own authorized Koha integration.
+### Online holds and self-checkout
+
+The portal now offers patron-scoped circulation actions from Koha book details:
+
+- **Place a hold:** the backend gets pickup locations valid for the signed-in patron and selected biblio, then posts a title-level hold to Koha. Koha checks branch rules, hold limits, account blocks, and queue eligibility. The session patron ID is always used; the browser cannot choose a different patron.
+- **Check out a copy:** only copies Koha currently reports as available show this action. The patron must physically have the copy. The backend first requests Koha's checkout-availability result, including blocks and confirmation warnings, then completes checkout through Koha's public self-checkout endpoint using Koha's confirmation token. Koha assigns the due date and applies circulation rules.
+
+To enable holds, the API staff account needs catalogue read access plus the Koha hold permission required by the deployed version (`reserveforothers:place_holds`; current Koha API specs may require the parent `reserveforothers:1` permission for `POST /holds`). This permission lets that API identity place holds for patrons, so keep access restricted to the backend secret and review the grant with the Koha administrator.
+
+The **My reading** page also lists current holds from `GET /patrons/{patron_id}/holds`, using the patron ID from the signed session. Koha's holds endpoint requires `borrowers:view_holds_history` (or `borrowers:edit_borrowers`); grant the narrower read permission where supported. Holds with a Koha waiting date/status are labeled **Now available**.
+
+To enable self-checkout, Koha's `RESTPublicAPI` system preference must allow the public checkout availability and checkout operations. This is a Koha configuration choice; review which public endpoints it exposes. Koha can reject a checkout because of item status, patron blocks, holds, debt limits, or circulation rules. The portal does not override those decisions. A `FEATURE_DISABLED` response means the public self-checkout capability is not enabled for this Koha instance.
+
+The [official Koha API reference](https://api.koha-community.org/Development.html) documents `GET /biblios/{biblio_id}/pickup_locations`, `POST /holds`, `GET /public/checkouts/availability`, and `POST /public/patrons/{patron_id}/checkouts`. Holds and checkouts are not simulated in demo mode. No hold or checkout was placed as part of implementing these controls.
+
+`APP_SESSION_SECRET` is generated in the ignored local `backend/.env`; restart the backend after changing it. Keep `SESSION_COOKIE_SECURE=false` only for local HTTP development; set it to `true` when serving the portal over HTTPS. Sign-in verifies identity; profile editing and live personal recommendations remain unavailable.
 
 ### Borrowing data needed for “My reading”
 
@@ -85,7 +100,7 @@ Koha's current API spec lists `circulate:circulate_remaining_permissions` and `c
 
 Biblio records and physical items are separate Koha resources. Search results indicate availability as `Unknown` until item records are retrieved; details request the items endpoint and derive status from Koha’s returned `checked_out_date`, `effective_not_for_loan_status`, lost and withdrawn fields. If status fields are missing/redacted, availability remains `Unknown`. Barcode/external item IDs, staff notes, patron records and due dates are not returned to the UI.
 
-Live portal dashboard and My reading use authenticated Koha borrower checkout data; recommendations and analytics still show explicit capability states instead of seeded sample patron information. Set `DEMO_MODE=true` only when intentionally previewing the labelled sample environment.
+Live dashboard, My reading, and Reading insights use the signed-in patron's Koha circulation data; live recommendations and profile editing remain unavailable instead of showing seeded patron data. Set `DEMO_MODE=true` only when intentionally previewing the labelled sample environment.
 
 ## Recommendation metadata
 
