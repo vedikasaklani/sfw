@@ -1,0 +1,376 @@
+SOFTWARE ENGINEERING PROJECT SUBMISSION
+Modern Library Portal - Koha Catalogue Integration
+
+Course: BCSE301P - Software Engineering
+Assessment 8: Module Testing and Test Report
+Assessment 9: User Interface Design
+Submission date shown on assignment: 30 October 2026
+Prepared from the implemented Modern Library Portal and the two supplied assessment PDFs.
+
+======================================================================
+ASSESSMENT 8 - TESTING AND TEST REPORT
+======================================================================
+
+1. Selected module
+------------------
+
+Module: Koha Catalogue Integration.
+
+This module lets the portal search bibliographic records, retrieve one
+record's details, and retrieve the associated item/copy availability. It
+contains the backend Koha REST client, mapping into the portal's Book DTO,
+the portal catalogue API routes, and the existing frontend catalogue
+consumer. Koha is the authoritative catalogue and item source. The portal
+does not create or maintain substitute live catalogue records.
+
+Main portal endpoints:
+
+  GET /api/v1/catalogue?q=<term>&subject=<subject>&page=<n>&page_size=<n>
+  GET /api/v1/catalogue/{biblio_id}
+  GET /api/v1/catalogue/{biblio_id}/items
+  GET /api/v1/koha/health
+
+The backend uses the host Koha API base configured by environment
+variables. OAuth2 client-credentials authentication is supported, including
+token caching and renewal after an upstream 401. Basic and configured
+bearer authentication are also supported. The browser never receives Koha
+credentials or tokens.
+
+2. Purpose and test objectives
+------------------------------
+
+The test objectives are to verify that:
+
+  a. Catalogue searches return the expected portal response, support
+     pagination and correctly map bibliographic fields.
+  b. A record detail request returns the correct bibliographic identifier
+     and safely handles missing fields.
+  c. Item records are handled separately from bibliographic records and
+     availability is derived only from returned Koha item statuses.
+  d. Authentication, timeouts, unavailable Koha responses, malformed data,
+     empty result sets and missing identifiers produce safe, useful errors.
+  e. OAuth credentials and access tokens are not returned in portal data.
+  f. Live mode does not quietly substitute seeded demo records when
+     credentials or Koha access are unavailable.
+
+3. Test environment and tools
+-----------------------------
+
+  Backend: Python / FastAPI, HTTPX and SQLAlchemy.
+  Automated runner: pytest with pytest-asyncio.
+  API test client: FastAPI TestClient.
+  Koha HTTP mocks: HTTPX MockTransport; no live Koha dependency for the
+                   deterministic automated tests.
+  Frontend build: React, TypeScript and Vite.
+  Local Koha: Koha Testing Docker (KTD), package version
+              26.06.00-35~git+20261015000118.f7f4ff75-1.
+
+The backend runs on the host, and the KTD publishes its staff API on
+localhost:8081. No container IP is used. The local application is configured
+with DEMO_MODE=false, KOHA_BASE_URL=http://localhost:8081,
+KOHA_API_PREFIX=/api/v1 and KOHA_AUTH_METHOD=oauth2. The Koha API client ID
+and secret are not configured yet.
+
+4. Manual testing procedure
+---------------------------
+
+The following manual API walkthrough was performed using individual
+FastAPI TestClient requests against the actual portal routes. The demo
+adapter was enabled in-process for this walkthrough only; the local .env
+file was not changed. This verifies the portal route flow and demo adapter,
+not an authenticated live Koha transaction.
+
+Reproduction procedure for the demo walkthrough:
+
+  1. In backend/.env, temporarily set DEMO_MODE=true and start the backend:
+       cd backend
+       uvicorn app.main:app --reload
+  2. Open http://localhost:8000/docs (or use the equivalent HTTP requests
+     below). Confirm the Health route reports mode "demo".
+  3. Search for Nature with page=1 and page_size=5. Confirm the response
+     contains portal book objects, a total, and source="demo".
+  4. Request the details for b-101. Confirm the title and identifier are
+     present.
+  5. Request b-101/items. Confirm a list of copies and their demo status is
+     displayed.
+  6. Request an unknown identifier. Confirm a not-found response appears
+     rather than an exception trace.
+  7. Request page_size=0. Confirm input validation rejects the request.
+  8. Before credentials were issued, a live-mode negative check was run with
+     blank OAuth fields. It returned a configuration error rather than
+     demo records. This check is historical; the current environment now
+     has credentials configured.
+  9. With current credentials present and DEMO_MODE=false, run the live
+     smoke checks listed below and confirm the source is "koha".
+
+Manual cases executed and observed:
+
+ID    Input / action                         Expected result              Actual result
+M01   GET /api/v1/health in demo mode         HTTP 200, mode=demo           PASS: HTTP 200, mode=demo
+M02   Search Nature, page 1, size 5           HTTP 200; mapped results      PASS: HTTP 200; 4 results; source=demo
+M03   GET /catalogue/b-101                   HTTP 200; matching book       PASS: HTTP 200; The Creative Act
+M04   GET /catalogue/b-101/items              HTTP 200; item list/status    PASS: HTTP 200; 3 demo items, Available
+M05   GET /catalogue/not-a-record             HTTP 404; safe message        PASS: HTTP 404; "Book not found"
+M06   Search with page_size=0                 HTTP 422; validation error    PASS: HTTP 422
+M07   Initial live mode, credentials absent   HTTP 503; no demo fallback    PASS at initial setup: missing OAuth client setting
+
+Live Koha connectivity checks performed separately:
+
+  - OPAC at http://localhost:8080 responded HTTP 200.
+  - Unauthenticated GET http://localhost:8081/api/v1/biblios?limit=1
+    responded HTTP 401. This confirms the API is reachable and requires
+    authentication; this was before the API client credentials were added.
+  - After OAuth client credentials were configured, the portal health route
+    returned HTTP 200 with status=connected.
+  - Authenticated catalogue search returned HTTP 200, source=koha, five
+    records in the requested page.
+  - The first returned Koha record's detail endpoint returned HTTP 200;
+    its item endpoint returned HTTP 200 with one item.
+  - The first authenticated API attempt returned HTTP 406. Adding the
+    Accept: application/json request header resolved it; subsequent live
+    health, search, detail and item calls succeeded.
+
+5. Automated test cases and outcomes
+------------------------------------
+
+The automated tests were run from backend with:
+
+  python -m pytest tests -q
+
+Result: 16 passed. The run emitted upstream deprecation warnings from the
+installed Starlette and pytest-asyncio versions; no test failed.
+
+Koha client tests (backend/tests/test_koha.py):
+
+ID    Scenario                              Expected / observed outcome
+A01   OAuth configured without credentials  Client rejects configuration with a safe message. PASS
+A02   OAuth catalogue search                 Token obtained; biblio DTO and pagination mapped. PASS
+A03   Biblio detail and related items        Correct ID, copy count and availability mapping. PASS
+A04   Item pagination                        Follows Koha Link pagination to later copies. PASS
+A05   Expired OAuth token                    Renews token once after upstream 401. PASS
+A06   Empty search and missing biblio        Empty list is valid; missing record maps to 404. PASS
+A07   Koha 403 and request timeout             Safe auth/upstream errors, no raw Koha body. PASS
+A08   Basic auth and unknown item state       Basic header sent; missing status stays Unknown. PASS
+
+Portal API and service tests:
+
+  - Health identifies demo mode.
+  - Live mode with missing credentials returns 503 and does not use demo
+    catalogue records; live patron dashboard is also unavailable.
+  - Catalogue search and page-size handling work in the demo adapter.
+  - Biblio detail, item endpoint and missing-record behavior work.
+  - Interest/profile persistence and input validation tests pass.
+  - Recommendation tests exclude already-read/loaned demo books and include
+    explanations.
+  - Analytics demo calculations return internally consistent sample counts.
+
+Frontend verification:
+
+  npm run build
+
+Result: TypeScript and Vite production build succeeded. Vite emitted a
+non-fatal advisory because the main JavaScript bundle is larger than 500 kB.
+No browser-based visual test was run for this assessment. Automated Koha
+tests use mocked HTTP responses, not live Koha records.
+
+6. Defects, errors and limitations
+----------------------------------
+
+No automated tests failed in the final run. The following integration
+observations and remaining limitations apply:
+
+  - KTD REST API returned HTTP 401 before credentials were configured. This
+    was resolved by configuring OAuth2 client credentials in the ignored
+    backend/.env file.
+  - An initial authenticated request returned HTTP 406 because the Koha
+    client did not explicitly request JSON. The backend now sends
+    Accept: application/json; the live smoke test passes.
+  - Member identity, loans and borrowing history are not part of this
+    catalogue test module and remain gated behind authentication and
+    borrower mapping.
+  - The frontend production build passes, but a browser interaction test
+    using the live catalogue in an actual browser remains outstanding.
+
+Live catalogue setup is complete. The app can now be opened at
+http://localhost:5173 while the backend is running; choose Explore books,
+search, then open a result to view its Koha record and item availability.
+Do not paste credentials into this report or frontend code.
+
+7. Test report conclusion
+-------------------------
+
+The catalogue integration's portal-side behavior is covered by automated
+tests and a manual route walkthrough. Field normalization, OAuth renewal,
+Basic auth, pagination, item availability mapping and safe failure states
+pass their deterministic checks. The KTD API is authenticated and the real
+portal search, detail and item endpoints have all returned live Koha data.
+Patron circulation and browser-level visual validation remain outside this
+verified catalogue slice.
+
+======================================================================
+ASSESSMENT 9 - USER INTERFACE DESIGN
+======================================================================
+
+1. Selected module and purpose
+------------------------------
+
+Module: Catalogue Search and Book Details.
+
+Purpose: help a library patron find a title in the Koha catalogue, see its
+bibliographic description and inspect copy availability without exposing
+Koha credentials or requiring the patron to understand Koha's API.
+
+Main user tasks:
+
+  - Enter a title, author, ISBN or supported catalogue search term.
+  - Narrow the search using the visible subject/mood chips.
+  - Read the matching book cards and availability summaries.
+  - Open a book to inspect bibliographic details and individual item status.
+  - Recognize whether content is demo data, live Koha data or unavailable.
+
+2. UI screen 1 - Catalogue search
+---------------------------------
+
+DESKTOP WIREFRAME (structure based on the implemented React screen)
+
++----------------------+------------------------------------------------+
+| commonplace          | My library  >  Explore books       [DEMO/LIVE] |
+| THE NEIGHBORHOOD ... |                              [bell] [profile] |
+|                      +------------------------------------------------+
+| Maplewood Library   | WEDNESDAY ...  YOUR READING SPACE              |
+|                      |                                                |
+| YOUR SPACE           | Find your next favourite                       |
+|                      | A few good pages can take you anywhere.        |
+| [Overview]           |                                                |
+| [Explore books]      | [ Search titles, authors, ISBNs... ] [Find]    |
+| [My reading]         | Browse by mood: [All] [Nature] [Fiction]       |
+| [For you]            |                   [Design] [Creativity] [Science]
+| [Reading insights]   |                                                |
+|                      | A few good places to start      [Recently added v]
+| YOUR LIBRARY CARD    |                                                |
+| [member card]        | [cover]       [cover]       [cover]       ...  |
+| [Account settings]   | subject       subject       subject             |
+|                      | Title         Title         Title               |
+|                      | Author        Author        Author              |
+|                      | copies/status copies/status copies/status         |
++----------------------+------------------------------------------------+
+
+Implemented inputs and controls:
+
+  - Search field with accessible label "Search books" and placeholder
+    "Search titles, authors, ISBNs...".
+  - Find a book button; Enter in the search field also submits the query.
+  - Mood/subject filter chips for All books, Nature, Fiction, Design,
+    Creativity and Science.
+  - Recently added sort control is displayed; a sort action is not currently
+    wired to a backend sort operation and should be treated as visual only.
+  - Search result cards are selectable and show a cover fallback, subject,
+    title, author, availability state and a detail affordance.
+  - The source pill distinguishes DEMO LIBRARY, KOHA CONNECTED and
+    KOHA OFFLINE states based on the backend health response.
+
+In live mode, search requests go to the portal's /api/v1/catalogue endpoint.
+The backend makes the Koha request and returns normalized records. No API
+credential is placed in the browser. If Koha auth is missing or Koha is
+unavailable, the portal displays an error notice and empty/error state; it
+does not quietly display the demo catalogue.
+
+3. UI screen 2 - Book details and copy availability
+----------------------------------------------------
+
++--------------------------------------------------------------+
+|                                      [close X]                |
+| [book cover]     SUBJECT / CATEGORY                           |
+|                  Bibliographic title                         |
+|                  by Author(s) - publication year             |
+|                  Description or available record notes       |
+|                  ● 2 copies - Available                      |
+|                  -----------------------------------------   |
+|                  MAIN BRANCH                  Available      |
+|                  EAST BRANCH                  On loan        |
+|                  [View at your library ->]                    |
++--------------------------------------------------------------+
+
+The detail dialog opens from a result card. For a live Koha result the
+frontend requests /api/v1/catalogue/{biblio_id}; the backend retrieves the
+bibliographic record and its associated items. The dialog displays the
+aggregate availability and safe item status/branch information. It does not
+display barcodes, internal notes, patron data or checkout due dates.
+
+If Koha does not return enough status information, availability is shown as
+Unknown / not reported rather than guessed. Holds and checkouts are not
+implemented as actions; the detail button currently provides an
+informational message that holds are managed in Koha, rather than creating
+a hold.
+
+4. UI screen 3 - Error and empty states
+---------------------------------------
+
+  - KOHA OFFLINE pill and a visible notice explain connection/auth errors.
+  - No matching records display a calm empty state with a suggestion to
+    change the search.
+  - A missing record produces a not-found response and safe message.
+  - An unavailable/redacted item status remains Unknown.
+  - Demo records are explicitly labelled DEMO LIBRARY.
+
+These states prevent a patron from confusing sample values with live
+availability. The interface can still be browsed in explicitly enabled
+demo mode while the live Koha client is being configured.
+
+5. Design principles
+--------------------
+
+Simplicity and hierarchy:
+  The page gives search the most prominent position, then filters and
+  results. The card design prioritizes title and author; less important
+  metadata is shown in smaller type.
+
+Consistency:
+  The shared navigation, breadcrumb, typography, rounded controls, spacing,
+  status chips and book cards are reused across the portal. The same source
+  indicator appears in the application header.
+
+Usability and feedback:
+  Search can be submitted by button or Enter. Result cards open details.
+  Empty, error, demo, offline and availability states provide feedback.
+  A modal keeps the patron in the catalogue context and has a clear close
+  control.
+
+Accessibility and responsiveness:
+  The search input has an aria-label, buttons are semantic controls, and the
+  layout adapts to smaller screens. The sidebar becomes a mobile menu and
+  book cards reflow into fewer columns on narrow viewports.
+
+Visual style:
+  The portal uses a light neutral background with white/grey surfaces,
+  rounded corners, restrained green for library actions and availability,
+  and warm yellow for attention states. Cover fallbacks keep the catalogue
+  usable when Koha does not provide a cover image.
+
+6. Requirement-to-interface mapping
+-----------------------------------
+
+Requirement                         Interface support
+Search by title/author/ISBN         Search field; backend query maps supported fields.
+Subject/category browsing           Visible filter chips; backend accepts subject filter.
+Paginated results                   Backend accepts page and page_size; UI requests first page.
+Book metadata                       Result cards and detail dialog show normalized DTO fields.
+Copy-level availability             Detail endpoint loads items and derives status from Koha fields.
+Missing/partial Koha data           Unknown availability, not-found and error states.
+Do not expose Koha credentials      Browser calls portal API only; secrets stay in backend env.
+Do not misrepresent sample data     Demo label; live mode has no fallback to seeded records.
+
+7. Design conclusion
+--------------------
+
+The catalogue screens give patrons a direct search-to-detail path: enter a
+term, scan results, then inspect the bibliographic record and copies. The
+interface follows the existing portal visual system and explains source and
+availability status. The UI and backend flow are implemented and the
+frontend build succeeds. Live record rendering will be confirmed after the
+Koha OAuth client is configured and an authenticated smoke test returns
+real catalogue records.
+
+======================================================================
+END OF SUBMISSION
+======================================================================
